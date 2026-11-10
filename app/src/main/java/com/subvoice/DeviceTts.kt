@@ -93,20 +93,39 @@ object DeviceTts {
         return "Voice ${ROMAN.getOrElse(index) { (index + 1).toString() }}  (${v.name})$g"
     }
 
-    /**
-     * The voice that will really be used for a gender: the saved choice (only if it really is that gender),
-     * else Voice II then I (female) or Voice IV then III (male), else any measured voice of that gender.
-     */
-    fun resolveName(p: Prefs, gender: String): String? {
+    /** Voices usable for a gender, best first: saved choice, then Voice II / I (female) or Voice IV / III (male), then any measured one. */
+    private fun candidates(p: Prefs, gender: String): List<String> {
         val list = installedVoices("hi")
-        if (list.isEmpty()) return null
+        if (list.isEmpty()) return emptyList()
         fun ok(n: String) = genderOfVoice(n).let { it == null || it == gender }
         val saved = if (gender == "male") p.devMale else p.devFemale
-        list.firstOrNull { it.name == saved && ok(it.name) }?.let { return it.name }
+        val out = ArrayList<String>()
+        list.firstOrNull { it.name == saved && ok(it.name) }?.let { out.add(it.name) }
         val pref = if (gender == "male") MALE_PREF else FEMALE_PREF
-        for (i in pref) list.getOrNull(i)?.let { if (ok(it.name)) return it.name }
-        list.firstOrNull { genderOfVoice(it.name) == gender }?.let { return it.name }
+        for (i in pref) list.getOrNull(i)?.let { if (ok(it.name)) out.add(it.name) }
+        for (v in list) if (genderOfVoice(v.name) == gender) out.add(v.name)
+        return out.distinct()
+    }
+
+    /**
+     * The voice that will really be used for a gender. [variant] = which person of that gender (0 = first, 1 = second ...):
+     * the first person gets the first choice (Voice II / IV), the second the next one (Voice I / III), so two women (or two
+     * men) of the video never sound the same.
+     */
+    fun resolveName(p: Prefs, gender: String, variant: Int = 0): String? {
+        val list = installedVoices("hi")
+        if (list.isEmpty()) return null
+        val c = candidates(p, gender)
+        if (c.isNotEmpty()) return c[variant % c.size]
+        val pref = if (gender == "male") MALE_PREF else FEMALE_PREF
         return list[minOf(pref[0], list.size - 1)].name
+    }
+
+    /** More persons than voices: the extra ones get a slightly lower / higher version of a voice. */
+    private fun pitchFor(p: Prefs, gender: String, variant: Int): Float {
+        val n = candidates(p, gender).size
+        if (n == 0 || variant < n) return 1f
+        return if ((variant - n) % 2 == 0) 0.92f else 1.08f
     }
 
     /** Measures the pitch of every installed Hindi voice once (cached), so gender never depends on guessing. */
@@ -196,28 +215,28 @@ object DeviceTts {
     }
 
     /** Must be called inside synchronized(lock). Sets language, then the exact voice, pitch and rate. */
-    private fun applyVoice(t: TextToSpeech, p: Prefs, gender: String, lang: String, rate: Float): Boolean {
+    private fun applyVoice(t: TextToSpeech, p: Prefs, gender: String, lang: String, rate: Float, variant: Int = 0): Boolean {
         val tag = if (lang == "hi") "hi-IN" else lang
         val r = t.setLanguage(Locale.forLanguageTag(tag))      // must come before setVoice
         if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
             State.status = "Install '$tag' voice data (button in app)"; return false
         }
         if (lang == "hi") {
-            val name = resolveName(p, gender)
+            val name = resolveName(p, gender, variant)
             val v = name?.let { n -> t.voices?.firstOrNull { it.name == n } }
             if (v != null && t.setVoice(v) != TextToSpeech.SUCCESS) State.status = "could not select ${v.name}"
         }
-        t.setPitch(1f)                       // pitch-shifting made the male voice sound robotic
+        t.setPitch(if (lang == "hi") pitchFor(p, gender, variant) else 1f)    // 1.0 unless there are more persons than voices
         t.setSpeechRate(rate)
         return true
     }
 
-    fun speak(ctx: Context, text: String, gender: String, lang: String) {
-        if (!ready) { init(ctx) { speak(ctx, text, gender, lang) }; return }
+    fun speak(ctx: Context, text: String, gender: String, lang: String, variant: Int = 0) {
+        if (!ready) { init(ctx) { speak(ctx, text, gender, lang, variant) }; return }
         val t = tts ?: return
         val p = Prefs(ctx)
         synchronized(lock) {
-            if (!applyVoice(t, p, gender, lang, 1.1f)) return
+            if (!applyVoice(t, p, gender, lang, 1.1f, variant)) return
             State.muteUntil = System.currentTimeMillis() + 1500L   // safety; exact end is set by the TTS callbacks
             t.speak(text, TextToSpeech.QUEUE_ADD, null, "u${System.nanoTime()}")
         }
@@ -228,7 +247,7 @@ object DeviceTts {
      * Renders the tablet's own Hindi voice into a WAV file (no sound is played) and waits for it.
      * This is near-instant and is the base that the Termux server turns into the cloned voice.
      */
-    fun synthToFile(ctx: Context, text: String, gender: String, lang: String, out: File): Boolean {
+    fun synthToFile(ctx: Context, text: String, gender: String, lang: String, out: File, variant: Int = 0): Boolean {
         if (!ready) {
             val l = CountDownLatch(1)
             init(ctx) { l.countDown() }
@@ -239,7 +258,7 @@ object DeviceTts {
         val id = "f${System.nanoTime()}"
         val w = Waiter()
         synchronized(lock) {
-            if (!applyVoice(t, Prefs(ctx), gender, lang, 1.15f)) return false
+            if (!applyVoice(t, Prefs(ctx), gender, lang, 1.15f, variant)) return false
             waiters[id] = w
             if (t.synthesizeToFile(text, Bundle(), out, id) != TextToSpeech.SUCCESS) { waiters.remove(id); return false }
         }
