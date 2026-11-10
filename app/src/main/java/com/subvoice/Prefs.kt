@@ -34,7 +34,19 @@ object State {
     @Volatile var events = 0
     @Volatile var pkg = ""
     @Volatile var ocrText = ""
-    @Volatile var speaker = ""        // id of the voice profile currently heard in the video (spk_1, spk_2 ...)
+    @Volatile var speaker = ""        // id of the person currently heard in the video (spk_f1, spk_m1, spk_m2 ...)
+    @Volatile var lastSpeech = 0L     // last time a clearly voiced (speech) sound was heard in the video audio
+
+    /**
+     * True while speech is being heard in the playing audio. Subtitles are only read then, so text elsewhere on the
+     * screen (menus, comments, articles) is never read. If the video app blocks audio capture (everything silent for
+     * a long time) the speech check cannot be done and is skipped.
+     */
+    fun speechRecent(): Boolean {
+        if (!capturing) return true
+        if (System.currentTimeMillis() - lastSpeech < 4000) return true
+        return audioFrames > 400 && audioLoud == 0
+    }
     val profileF0 = java.util.concurrent.ConcurrentHashMap<String, Float>()
     @Volatile var audioFrames = 0
     @Volatile var audioLoud = 0
@@ -46,7 +58,7 @@ object State {
 
     /** Forget everything captured during a session (called on Stop). */
     fun resetCapture(ctx: Context) {
-        capturing = false; audioFrames = 0; audioLoud = 0; speaker = ""; ocrText = ""; debug = ""
+        capturing = false; audioFrames = 0; audioLoud = 0; lastSpeech = 0L; speaker = ""; ocrText = ""; debug = ""
         created.clear(); uploaded.clear(); profileF0.clear()
         try { ctx.filesDir.listFiles()?.filter { it.name.startsWith("spk_") }?.forEach { it.delete() } } catch (_: Exception) {}
         status = "stopped"
