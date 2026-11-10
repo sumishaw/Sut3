@@ -57,8 +57,8 @@ object Speaker {
     @Volatile private var curLatch: CountDownLatch? = null
 
     /**
-     * female/male for a speaker profile. Profiles are per gender ("spk_f" / "spk_m"), so the gender is simply the
-     * profile that was heard; it only changes when the video really changes from a female to a male voice (or back).
+     * female/male for a speaker profile (spk_f1, spk_f2 = women, spk_m1, spk_m2 = men): the gender is simply the person
+     * that was heard; it changes when the video changes from a female to a male voice (or back).
      */
     private fun genderOf(p: Prefs, vid: String?): String {
         if (p.genderMode != "auto") return p.genderMode
@@ -68,6 +68,12 @@ object Speaker {
             vid.startsWith("spk_m") -> "male"
             else -> State.gender
         }
+    }
+
+    /** 0 for the first person of a gender (spk_f1 / spk_m1), 1 for the second ... : every person gets a different tablet voice. */
+    private fun variantOf(spk: String?): Int {
+        if (spk == null || !spk.startsWith("spk_")) return 0
+        return ((spk.takeLastWhile { it.isDigit() }.toIntOrNull() ?: 1) - 1).coerceAtLeast(0)
     }
 
     fun serverFor(p: Prefs, engine: String) = when (engine) {
@@ -111,7 +117,7 @@ object Speaker {
                 } catch (e: Exception) {
                     if (j.epoch != epoch) continue
                     State.status = "Server problem (${e.message}) -> device voice"
-                    if (p.fallback) DeviceTts.speak(app, j.text, genderOf(p, j.spk.ifEmpty { null }), p.lang)
+                    if (p.fallback) DeviceTts.speak(app, j.text, genderOf(p, j.spk.ifEmpty { null }), p.lang, variantOf(j.spk))
                     finishOne()
                 }
             }
@@ -131,7 +137,7 @@ object Speaker {
         val app = ctx.applicationContext
         appCtx = app
         val p = Prefs(app)
-        if (p.engine == "device") { DeviceTts.speak(app, text, genderOf(p, spk.ifEmpty { null }), p.lang); return }
+        if (p.engine == "device") { DeviceTts.speak(app, text, genderOf(p, spk.ifEmpty { null }), p.lang, variantOf(spk)); return }
         if (p.pauseVideo && inFlight.get() == 0) Media.key(app, KeyEvent.KEYCODE_MEDIA_PAUSE)
         inFlight.incrementAndGet()
         start()
@@ -161,7 +167,7 @@ object Speaker {
         val g = genderOf(p, if (spk.isNotEmpty()) spk else vid)
         val raw = File(ctx.cacheDir, "d${System.nanoTime()}.wav")
         val t0 = System.currentTimeMillis()
-        if (!DeviceTts.synthToFile(ctx, text, g, p.lang, raw)) {
+        if (!DeviceTts.synthToFile(ctx, text, g, p.lang, raw, variantOf(spk))) {
             raw.delete(); error("tablet voice failed (is Hindi voice data installed?)")
         }
         val t1 = System.currentTimeMillis()
