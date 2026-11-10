@@ -17,6 +17,7 @@ class CaptionService : AccessibilityService() {
     private var sw = 0
     private var sh = 0
     private var visited = 0
+    private var nodes = 0
 
     @Suppress("DEPRECATION")
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
@@ -26,6 +27,7 @@ class CaptionService : AccessibilityService() {
         if (!Prefs(this).enabled) return
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         if (!am.isMusicActive) return                      // only while a video/audio is playing
+        if (!State.speechRecent()) return                  // and only while speech is heard: subtitles belong to speech
         if (State.capturing && VideoWatch.tracking && !VideoWatch.recent()) return   // screen reader running: only while a video is really on screen
         run {
             val dm = android.util.DisplayMetrics()
@@ -36,10 +38,11 @@ class CaptionService : AccessibilityService() {
         val now = System.currentTimeMillis()
         val dbg: MutableList<String>? = if (now - lastDbg > 1500) { lastDbg = now; mutableListOf() } else null
         val sb = StringBuilder()
-        visited = 0
+        visited = 0; nodes = 0
         collect(root, sb, dbg)
         if (dbg != null) State.debug = dbg.joinToString("\n")
         val text = sb.toString().trim()
+        if (nodes > 3 || text.length > 220) return          // a subtitle is 1-3 short lines; more text is a page, not a subtitle
         if (text.isNotEmpty() && text != last) {
             last = text
             Pipeline.onCaption(applicationContext, text)
@@ -51,16 +54,16 @@ class CaptionService : AccessibilityService() {
         if (devShare(txt) < 0.5) return false
         if (sw <= 0 || sh <= 0) return true
         val b = Rect(); n.getBoundsInScreen(b)
-        if (b.isEmpty) return false
+        if (b.isEmpty || b.height() > sh * 0.15f) return false
         val cx = (b.left + b.right) / 2f / sw
         val cy = (b.top + b.bottom) / 2f / sh
         if (State.capturing && VideoWatch.tracking) {
             val v = VideoWatch
             val rw = v.r - v.l; val rh = v.b - v.t
-            return cx >= v.l && cx <= v.r && cy >= v.t + 0.4f * rh && cy <= v.b + 0.03f &&
+            return cx >= v.l && cx <= v.r && cy >= v.t + 0.58f * rh && cy <= v.b + 0.03f &&
                 kotlin.math.abs(cx - (v.l + v.r) / 2f) < 0.25f * rw
         }
-        return cy > 0.5f && kotlin.math.abs(cx - 0.5f) < 0.25f
+        return cy > 0.6f && kotlin.math.abs(cx - 0.5f) < 0.25f
     }
 
     private fun collect(n: AccessibilityNodeInfo?, out: StringBuilder, dbg: MutableList<String>?) {
@@ -71,9 +74,11 @@ class CaptionService : AccessibilityService() {
             if (dbg != null && dbg.size < 8) dbg.add(id.substringAfterLast('/') + ": " + txt.take(40))
             // Browsers (Chrome etc.) give web text no view id, so while the playing video's position is known, ANY non-clickable
             // Hindi text lying centred in the lower part of that video counts; otherwise the id must say caption/subtitle.
-            val capId = id.contains("caption") || id.contains("subtitle") || id.contains("subs") || id.contains("cue")
+            val sid = id.substringAfterLast('/')
+            val capId = sid.contains("caption") || sid.contains("subtitle") || sid == "subs" || sid == "cue_text" || sid == "cues"
             val byPlace = State.capturing && VideoWatch.tracking && VideoWatch.recent()
-            if ((capId || byPlace) && !n.isClickable && n.isVisibleToUser && inVideo(n, txt)) out.append(txt).append(' ')
+            val editable = n.isEditable || (n.className?.toString() ?: "").contains("EditText")
+            if ((capId || byPlace) && !n.isClickable && !editable && n.isVisibleToUser && inVideo(n, txt)) { out.append(txt).append(' '); nodes++ }
         }
         for (i in 0 until n.childCount) collect(n.getChild(i), out, dbg)
     }
