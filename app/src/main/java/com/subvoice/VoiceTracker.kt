@@ -79,7 +79,7 @@ object VoiceDsp {
         }
         var tau = minLag
         while (tau < maxLag) {
-            if (cm[tau] < 0.2f) {
+            if (cm[tau] < 0.3f) {
                 while (tau + 1 < maxLag && cm[tau + 1] < cm[tau]) tau++
                 val a = cm[tau - 1]
                 val b = cm[tau]
