@@ -45,7 +45,7 @@ object Media {
  *  - stopAll() instantly silences everything (used by Stop)
  */
 object Speaker {
-    private const val MAX_BACKLOG = 7
+    private const val MAX_BACKLOG = 40
     private class Job(val text: String, val spk: String, val epoch: Int)
     private val jobs = LinkedBlockingDeque<Job>()
     private val playQ = LinkedBlockingDeque<File>()
