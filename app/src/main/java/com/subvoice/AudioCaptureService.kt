@@ -40,7 +40,7 @@ object VideoWatch {
     @Volatile var tracking = false          // true while the screen reader is running (so a video rectangle can be known)
     fun set(v: FloatArray) { l = v[0]; t = v[1]; r = v[2]; b = v[3]; lastActive = System.currentTimeMillis() }
     fun off() { lastActive = 0L }
-    fun recent() = System.currentTimeMillis() - lastActive < 2500
+    fun recent() = System.currentTimeMillis() - lastActive < 6000
 }
 
 /** Share (0..1) of the non-space characters that are Devanagari. */
@@ -223,7 +223,7 @@ class AudioCaptureService : Service() {
 
     private val rectHist = ArrayList<FloatArray>()
 
-    private fun resetMotion() { prevLum = null; motionHist.clear(); rectHist.clear() }
+    private fun resetMotion() { prevLum = null; motionHist.clear(); rectHist.clear(); heldRect = null }
 
     private fun iou(a: FloatArray, b: FloatArray): Float {
         val l = maxOf(a[0], b[0]); val t = maxOf(a[1], b[1]); val r = minOf(a[2], b[2]); val bt = minOf(a[3], b[3])
@@ -236,12 +236,21 @@ class AudioCaptureService : Service() {
      * A video is a rectangle that keeps moving AT THE SAME PLACE for a while. A scrolling page, a swipe, a pop-up or an
      * animation moves different areas from moment to moment (or only for a moment) and is therefore never accepted.
      */
+    private var heldRect: FloatArray? = null
+    private var heldAt = 0L
+
     private fun stableRect(r: FloatArray?): FloatArray? {
-        if (r == null) { rectHist.clear(); return null }
-        rectHist.add(r)
-        while (rectHist.size > 6) rectHist.removeAt(0)
-        val same = rectHist.count { iou(it, r) >= 0.75f }
-        return if (rectHist.size >= 5 && same >= 4) r else null
+        val now = System.currentTimeMillis()
+        if (r != null) {
+            rectHist.add(r)
+            while (rectHist.size > 6) rectHist.removeAt(0)
+            val same = rectHist.count { iou(it, r) >= 0.75f }
+            if (rectHist.size >= 4 && same >= 3) { heldRect = r; heldAt = now; return r }
+        }
+        // a calm scene (little motion for a moment) must not stop the subtitles: keep the video area found a moment ago
+        val h = heldRect
+        if (h != null && now - heldAt < 6000) return h
+        return null
     }
 
     /**
@@ -316,9 +325,6 @@ class AudioCaptureService : Service() {
                 // read only while audio is playing and SubVoice's own screen is not in front
                 if (img != null && (State.appVisible || !am.isMusicActive)) {
                     img.close(); State.ocrText = "(idle)"; resetMotion(); VideoWatch.off()
-                } else if (img != null && !State.speechRecent()) {
-                    // subtitles belong to speech: nobody is speaking in the playing audio, so nothing on screen is read
-                    img.close(); State.ocrText = "(no speech heard in the video audio - nothing is read)"; VideoWatch.off()
                 } else if (img != null) {
                     val w = img.width; val h = img.height
                     val pl = img.planes[0]
@@ -337,7 +343,7 @@ class AudioCaptureService : Service() {
                         val vy = (vr[1] * h).toInt().coerceIn(0, h - 2)
                         val vw = minOf(((vr[2] - vr[0]) * w).toInt(), w - vx)
                         val vh = minOf(((vr[3] - vr[1]) * h).toInt(), h - vy)
-                        val top = vy + (vh * 0.58).toInt()              // subtitles sit in the lower part of the VIDEO itself (never the whole screen)
+                        val top = vy + (vh * 0.45).toInt()              // subtitles sit in the lower part of the VIDEO itself (never the whole screen)
                         val ch = vy + vh - top
                         if (vw >= 64 && ch >= 24) {
                             val crop = Bitmap.createBitmap(frame, vx, top, vw, ch)
@@ -353,8 +359,8 @@ class AudioCaptureService : Service() {
                                     b.height() <= vh * sc * 0.16f && devShare(l.text) >= 0.5
                             }.sortedBy { it.boundingBox!!.top }
                             // a real subtitle is one to three short lines; a whole block of text is a page, not a subtitle
-                            val joined = if (lines.size in 1..3) lines.joinToString(" ") { it.text } else ""
-                            handleOcr(if (joined.length <= 220) joined else "")
+                            val joined = if (lines.size in 1..5) lines.joinToString(" ") { it.text } else ""
+                            handleOcr(if (joined.length <= 300) joined else "")
                             if (joined.isBlank())
                                 State.ocrText = "(video found ${vw}x${vh}; no Hindi subtitle line. saw: ${res.text.replace('\n', ' ').take(40)})"
                             if (shot !== crop) shot.recycle()
@@ -366,7 +372,7 @@ class AudioCaptureService : Service() {
                 }
             } catch (e: InterruptedException) { break
             } catch (e: Exception) { if (running) State.status = "OCR: ${e.message}" }
-            try { Thread.sleep(120) } catch (e: InterruptedException) { break }
+            try { Thread.sleep(40) } catch (e: InterruptedException) { break }
         }
     }
 
