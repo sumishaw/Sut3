@@ -381,9 +381,9 @@ class AudioCaptureService : Service() {
         val text = text0.replace('\n', ' ').trim()
         State.ocrText = text
         val letters = text.filter { !it.isWhitespace() }
-        if (letters.length < 3) return
+        if (letters.length < 3) { Pipeline.onGone(); return }
         val dev = letters.count { it.code in 0x0900..0x097F }
-        if (dev * 2 < letters.length) return                   // only mostly-Hindi lines count as subtitles
+        if (dev * 2 < letters.length) { Pipeline.onGone(); return }     // only mostly-Hindi lines count as subtitles
         Pipeline.onCaption(applicationContext, text)
     }
 
