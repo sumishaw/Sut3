@@ -35,6 +35,7 @@ object State {
     @Volatile var pkg = ""
     @Volatile var ocrText = ""
     @Volatile var speaker = ""        // id of the person currently heard in the video (spk_f1, spk_m1, spk_m2 ...)
+    @Volatile var voicedFrames = 0    // number of clearly voiced 32 ms frames heard so far (the voice tracker's evidence)
     @Volatile var lastSpeech = 0L     // last time a clearly voiced (speech) sound was heard in the video audio
 
     /**
@@ -58,7 +59,7 @@ object State {
 
     /** Forget everything captured during a session (called on Stop). */
     fun resetCapture(ctx: Context) {
-        capturing = false; audioFrames = 0; audioLoud = 0; lastSpeech = 0L; speaker = ""; ocrText = ""; debug = ""
+        capturing = false; audioFrames = 0; audioLoud = 0; lastSpeech = 0L; voicedFrames = 0; speaker = ""; ocrText = ""; debug = ""
         created.clear(); uploaded.clear(); profileF0.clear()
         try { ctx.filesDir.listFiles()?.filter { it.name.startsWith("spk_") }?.forEach { it.delete() } } catch (_: Exception) {}
         status = "stopped"
