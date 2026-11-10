@@ -135,7 +135,7 @@ class AudioCaptureService : Service() {
             if (now < State.muteUntil) continue            // on-device TTS is speaking
             var e = 0.0
             for (s in buf) e += s.toDouble() * s
-            if (sqrt(e / buf.size) < 250) continue         // silence
+            if (sqrt(e / buf.size) < 100) continue         // silence (low threshold: quiet dialogue must still be tracked)
             State.audioLoud++
             System.arraycopy(win, 512, win, 0, 512); System.arraycopy(buf, 0, win, 512, 512)
             pe[0] = win[0].toFloat()
@@ -145,6 +145,7 @@ class AudioCaptureService : Service() {
             if (f > 0f) {
                 lastVoiced = now
                 State.lastSpeech = now
+                State.voicedFrames++
                 val v = tracker.onFrame(now, f.toDouble(), VoiceDsp.mfcc(win))
                 State.profileF0["_live"] = f; State.profileF0["_score"] = tracker.lastDist.toFloat()
                 if (v != null) {
