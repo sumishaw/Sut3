@@ -45,6 +45,9 @@ class CaptionService : AccessibilityService() {
         if (text.isNotEmpty() && text != last) {
             last = text
             Pipeline.onCaption(applicationContext, text)
+        } else if (text.isEmpty() && last.isNotEmpty()) {
+            last = ""
+            Pipeline.onGone()
         }
     }
 
@@ -85,80 +88,117 @@ class CaptionService : AccessibilityService() {
     override fun onInterrupt() {}
 }
 
-fun similar(a: String, b: String): Boolean {
-    fun grams(s: String) = s.filter { !it.isWhitespace() }.windowed(2).toSet()
-    val x = grams(a); val y = grams(b)
-    if (x.size < 8 || y.size < 8) return a == b                       // short sentences are only "the same" when really equal
-    return x.intersect(y).size.toDouble() / x.union(y).size >= 0.9
+/** Letters, digits and Devanagari vowel signs only (ignores punctuation, spaces, case). */
+fun normText(s: String): String = s.filter {
+    Character.isLetterOrDigit(it) ||
+        Character.getType(it).let { t -> t == Character.NON_SPACING_MARK.toInt() || t == Character.COMBINING_SPACING_MARK.toInt() }
+}.lowercase()
+
+/** Similarity 0..1 of two normalised texts (edit distance), tolerant to the small reading mistakes of OCR. */
+fun textSim(a: String, b: String): Double {
+    if (a == b) return 1.0
+    val n = a.length
+    val m = b.length
+    if (n == 0 || m == 0) return 0.0
+    var prev = IntArray(m + 1) { it }
+    var cur = IntArray(m + 1)
+    for (i in 1..n) {
+        cur[0] = i
+        for (j in 1..m) {
+            val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+            cur[j] = minOf(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        }
+        val t = prev; prev = cur; cur = t
+    }
+    return 1.0 - prev[m].toDouble() / maxOf(n, m)
 }
 
+/** The same caption read twice (OCR jitter, punctuation, one wrong letter)? Very short texts must be equal. */
+fun similar(a: String, b: String): Boolean {
+    val x = normText(a)
+    val y = normText(b)
+    if (x.length < 5 || y.length < 5) return x == y
+    return textSim(x, y) >= 0.78
+}
+
+private fun sameWord(a: String, b: String): Boolean {
+    val x = normText(a)
+    val y = normText(b)
+    if (x.isEmpty() || y.isEmpty()) return false
+    if (x == y) return true
+    if (x.length < 3 || y.length < 3) return false
+    return textSim(x, y) >= 0.7
+}
+
+private fun words(s: String): List<String> = s.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+
 /**
- * Debounces rolling/jittery captions and speaks only NEW text. Thread-safe entry point.
+ * Debounces rolling/jittery captions and speaks every NEW sentence exactly once.
+ *  - while the SAME caption stays on screen it is never spoken again, however often (or how differently) OCR reads it
+ *  - a sentence that comes back AFTER other sentences, or after the caption was gone for a moment, is spoken normally
  *  - a caption replaced by a DIFFERENT line before its timer fires is spoken immediately instead of being lost
- *  - every spoken line is remembered for a while: OCR jitter, a two-line caption collapsing back to one line,
- *    or the same line arriving from both the accessibility reader and OCR is NOT spoken again (no loops)
  */
 object Pipeline {
     private val h = Handler(Looper.getMainLooper())
     @Volatile private var pending = ""
     private var done = true
-    private var spoken = ""
+    private var spoken = ""               // full text of the caption as it was when last committed
     private var run: Runnable? = null
     private var arrivedAt = 0L            // when the current caption first appeared
     private var framesAtArrival = 0       // voiced frames the voice tracker had heard by then
 
-    private class Said(val norm: String, val grams: Set<String>, val t: Long)
-    private val history = ArrayList<Said>()
-    private const val WINDOW_MS = 10_000L
+    private var lastDelta = ""            // the sentence spoken last
+    private var lastAt = 0L
+    private var lastGone = false          // the caption disappeared since that sentence was spoken
+    private var blankSince = 0L           // screen reader sees no subtitle since ...
 
     fun reset() {
         run?.let { h.removeCallbacks(it) }
         pending = ""; spoken = ""; done = true
-        synchronized(history) { history.clear() }
+        lastDelta = ""; lastAt = 0L; lastGone = false; blankSince = 0L
     }
 
-    /** letters, digits and Devanagari vowel signs only (ignores punctuation, spaces, case). */
-    private fun norm(s: String): String = s.filter {
-        Character.isLetterOrDigit(it) ||
-            Character.getType(it).let { t -> t == Character.NON_SPACING_MARK.toInt() || t == Character.COMBINING_SPACING_MARK.toInt() }
-    }.lowercase()
+    /** The subtitle reader found NO subtitle on screen right now. */
+    fun onGone() {
+        h.post { if (blankSince == 0L) blankSince = System.currentTimeMillis() }
+    }
 
-    private fun grams(n: String): Set<String> = if (n.length < 2) setOf(n) else n.windowed(2).toSet()
-
-    /** True when this text (or nearly all of it) was already spoken a moment ago. */
-    private fun alreadySpoken(text: String): Boolean {
-        val n = norm(text)
+    /** The same sentence as the one spoken last, with no other sentence in between? (a different sentence between = fine) */
+    private fun repeated(delta: String): Boolean {
+        val n = normText(delta)
         if (n.isEmpty()) return true
-        val g = grams(n)
         val now = System.currentTimeMillis()
-        synchronized(history) {
-            history.removeAll { now - it.t > WINDOW_MS }
-            for (s in history) {
-                if (s.norm == n) return true
-                if (n.length >= 10 && s.norm.contains(n)) return true           // a part of an earlier line
-                if (n.length >= 12 && g.count { it in s.grams }.toDouble() / g.size >= 0.85) return true   // jittery re-read
-            }
-        }
+        if (lastDelta.isEmpty() || now - lastAt > 40_000) return false
+        if (lastGone && now - lastAt >= 2500) return false          // it went away and this is a genuine new showing
+        if (similar(delta, lastDelta)) return true
+        if (n.length >= 6 && normText(lastDelta).contains(n)) return true
         return false
     }
 
-    private fun remember(text: String) {
-        val n = norm(text)
-        if (n.isEmpty()) return
-        synchronized(history) {
-            history.add(Said(n, grams(n), System.currentTimeMillis()))
-            while (history.size > 12) history.removeAt(0)
-        }
-    }
-
-    /** What is new in [cur] compared with the line spoken before (handles rolling 2-line captions). */
+    /** What is new in [cur] compared with the caption committed before (handles rolling 2-line captions and OCR jitter). */
     private fun newPart(cur: String): String {
         if (spoken.isEmpty()) return cur
-        if (cur.startsWith(spoken)) return cur.removePrefix(spoken)
-        if (cur.length >= 10 && spoken.contains(cur)) return ""         // caption shrank back to one of its lines
         if (similar(cur, spoken)) return ""
-        for (k in minOf(spoken.length, cur.length - 1) downTo 6) {      // old tail == start of new text
-            if (cur.startsWith(spoken.takeLast(k))) return cur.drop(k)
+        val sw = words(spoken)
+        val cw = words(cur)
+        if (sw.isEmpty() || cw.isEmpty()) return cur
+        // only a part of what was spoken is on screen (caption shrank / one line of a two-line caption)
+        if (normText(cur).length >= 6 && cw.size <= sw.size) {
+            for (st in 0..(sw.size - cw.size)) {
+                var ok = true
+                for (i in cw.indices) if (!sameWord(sw[st + i], cw[i])) { ok = false; break }
+                if (ok) return ""
+            }
+        }
+        // rolling caption: the end of the old text is the start of the new text -> only the rest is new
+        for (k in minOf(sw.size, cw.size - 1) downTo 1) {
+            var ok = true
+            for (i in 0 until k) if (!sameWord(sw[sw.size - k + i], cw[i])) { ok = false; break }
+            if (ok) {
+                var chars = 0
+                for (i in 0 until k) chars += normText(cw[i]).length
+                if (chars >= 6) return cw.drop(k).joinToString(" ")
+            }
         }
         return cur
     }
@@ -180,8 +220,8 @@ object Pipeline {
         val cur = pending
         val delta = newPart(cur).trim()
         spoken = cur
-        if (delta.length > 1 && !alreadySpoken(delta)) {
-            remember(delta)
+        if (delta.length > 1 && !repeated(delta)) {
+            lastDelta = delta; lastAt = System.currentTimeMillis(); lastGone = false
             State.lastCaption = delta
             Speaker.enqueue(ctx.applicationContext, delta, State.speaker)
         }
@@ -189,6 +229,11 @@ object Pipeline {
 
     fun onCaption(ctx: Context, text: String) {
         h.post {
+            val now = System.currentTimeMillis()
+            if (blankSince != 0L && now - blankSince >= 800 && done) {
+                pending = ""; spoken = ""; lastGone = true            // the caption really went away: a fresh start
+            }
+            blankSince = 0L
             if (text == pending) return@post                 // same text re-read (OCR polls often)
             run?.let { h.removeCallbacks(it) }
             if (!done && pending.isNotEmpty() && !text.startsWith(pending) && !similar(text, pending)) {
