@@ -104,6 +104,8 @@ object Pipeline {
     private var done = true
     private var spoken = ""
     private var run: Runnable? = null
+    private var arrivedAt = 0L            // when the current caption first appeared
+    private var framesAtArrival = 0       // voiced frames the voice tracker had heard by then
 
     private class Said(val norm: String, val grams: Set<String>, val t: Long)
     private val history = ArrayList<Said>()
@@ -161,8 +163,19 @@ object Pipeline {
         return cur
     }
 
-    private fun commit(ctx: Context) {
+    private fun commit(ctx: Context, force: Boolean = false) {
         if (done) return
+        // A subtitle often appears a moment BEFORE its speaker starts talking. Give the voice tracker a short time (max 0.7 s)
+        // to hear the voice of THIS line (>= 5 voiced frames), so a man after a woman (or a new person) gets the right voice.
+        // If no new voice is heard in that time, the last voice simply stays.
+        val now = System.currentTimeMillis()
+        if (!force && State.capturing && now >= State.muteUntil &&
+            State.voicedFrames - framesAtArrival < 5 && now - arrivedAt < 700) {
+            val r = Runnable { commit(ctx) }
+            run = r
+            h.postDelayed(r, 60)
+            return
+        }
         done = true
         val cur = pending
         val delta = newPart(cur).trim()
@@ -179,7 +192,10 @@ object Pipeline {
             if (text == pending) return@post                 // same text re-read (OCR polls often)
             run?.let { h.removeCallbacks(it) }
             if (!done && pending.isNotEmpty() && !text.startsWith(pending) && !similar(text, pending)) {
-                commit(ctx)                                  // a different line replaced it: speak the old one now
+                commit(ctx, true)                            // a different line replaced it: speak the old one now
+            }
+            if (done || pending.isEmpty() || !(text.startsWith(pending) || similar(text, pending))) {
+                arrivedAt = System.currentTimeMillis(); framesAtArrival = State.voicedFrames    // a NEW caption
             }
             pending = text; done = false
             run = Runnable { commit(ctx) }
