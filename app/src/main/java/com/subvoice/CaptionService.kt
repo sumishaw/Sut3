@@ -27,7 +27,6 @@ class CaptionService : AccessibilityService() {
         if (!Prefs(this).enabled) return
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         if (!am.isMusicActive) return                      // only while a video/audio is playing
-        if (!State.speechRecent()) return                  // and only while speech is heard: subtitles belong to speech
         if (State.capturing && VideoWatch.tracking && !VideoWatch.recent()) return   // screen reader running: only while a video is really on screen
         run {
             val dm = android.util.DisplayMetrics()
@@ -42,7 +41,7 @@ class CaptionService : AccessibilityService() {
         collect(root, sb, dbg)
         if (dbg != null) State.debug = dbg.joinToString("\n")
         val text = sb.toString().trim()
-        if (nodes > 3 || text.length > 220) return          // a subtitle is 1-3 short lines; more text is a page, not a subtitle
+        if (nodes > 6 || text.length > 300) return          // a subtitle is a few short lines; much more text is a page, not a subtitle
         if (text.isNotEmpty() && text != last) {
             last = text
             Pipeline.onCaption(applicationContext, text)
@@ -60,7 +59,7 @@ class CaptionService : AccessibilityService() {
         if (State.capturing && VideoWatch.tracking) {
             val v = VideoWatch
             val rw = v.r - v.l; val rh = v.b - v.t
-            return cx >= v.l && cx <= v.r && cy >= v.t + 0.58f * rh && cy <= v.b + 0.03f &&
+            return cx >= v.l && cx <= v.r && cy >= v.t + 0.45f * rh && cy <= v.b + 0.03f &&
                 kotlin.math.abs(cx - (v.l + v.r) / 2f) < 0.25f * rw
         }
         return cy > 0.6f && kotlin.math.abs(cx - 0.5f) < 0.25f
@@ -75,7 +74,7 @@ class CaptionService : AccessibilityService() {
             // Browsers (Chrome etc.) give web text no view id, so while the playing video's position is known, ANY non-clickable
             // Hindi text lying centred in the lower part of that video counts; otherwise the id must say caption/subtitle.
             val sid = id.substringAfterLast('/')
-            val capId = sid.contains("caption") || sid.contains("subtitle") || sid == "subs" || sid == "cue_text" || sid == "cues"
+            val capId = sid.contains("caption") || sid.contains("subtitle") || sid.contains("subs") || sid.contains("cue")
             val byPlace = State.capturing && VideoWatch.tracking && VideoWatch.recent()
             val editable = n.isEditable || (n.className?.toString() ?: "").contains("EditText")
             if ((capId || byPlace) && !n.isClickable && !editable && n.isVisibleToUser && inVideo(n, txt)) { out.append(txt).append(' '); nodes++ }
@@ -89,8 +88,8 @@ class CaptionService : AccessibilityService() {
 fun similar(a: String, b: String): Boolean {
     fun grams(s: String) = s.filter { !it.isWhitespace() }.windowed(2).toSet()
     val x = grams(a); val y = grams(b)
-    if (x.isEmpty() || y.isEmpty()) return a == b
-    return x.intersect(y).size.toDouble() / x.union(y).size >= 0.85
+    if (x.size < 8 || y.size < 8) return a == b                       // short sentences are only "the same" when really equal
+    return x.intersect(y).size.toDouble() / x.union(y).size >= 0.9
 }
 
 /**
@@ -108,7 +107,7 @@ object Pipeline {
 
     private class Said(val norm: String, val grams: Set<String>, val t: Long)
     private val history = ArrayList<Said>()
-    private const val WINDOW_MS = 25_000L
+    private const val WINDOW_MS = 10_000L
 
     fun reset() {
         run?.let { h.removeCallbacks(it) }
@@ -134,8 +133,8 @@ object Pipeline {
             history.removeAll { now - it.t > WINDOW_MS }
             for (s in history) {
                 if (s.norm == n) return true
-                if (n.length >= 4 && s.norm.contains(n)) return true            // a part of an earlier line
-                if (n.length >= 6 && g.count { it in s.grams }.toDouble() / g.size >= 0.8) return true   // jittery re-read
+                if (n.length >= 10 && s.norm.contains(n)) return true           // a part of an earlier line
+                if (n.length >= 12 && g.count { it in s.grams }.toDouble() / g.size >= 0.85) return true   // jittery re-read
             }
         }
         return false
@@ -154,7 +153,7 @@ object Pipeline {
     private fun newPart(cur: String): String {
         if (spoken.isEmpty()) return cur
         if (cur.startsWith(spoken)) return cur.removePrefix(spoken)
-        if (spoken.contains(cur)) return ""                              // caption shrank back to one of its lines
+        if (cur.length >= 10 && spoken.contains(cur)) return ""         // caption shrank back to one of its lines
         if (similar(cur, spoken)) return ""
         for (k in minOf(spoken.length, cur.length - 1) downTo 6) {      // old tail == start of new text
             if (cur.startsWith(spoken.takeLast(k))) return cur.drop(k)
