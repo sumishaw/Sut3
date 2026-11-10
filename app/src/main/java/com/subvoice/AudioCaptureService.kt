@@ -29,6 +29,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.concurrent.thread
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.sqrt
 
@@ -111,36 +112,19 @@ class AudioCaptureService : Service() {
         audioT = thread(name = "audio") { audioLoop() }
     }
 
-    private class Prof(val id: String, var f0: Float) {
-        val ring = ShortArray(RING)
-        var pos = 0
-        var filled = 0
-        var lastSave = 0L
-        var lastUsed = 0L
-    }
-
     /**
-     * Tracks WHO is speaking, by gender. Exactly two voice profiles exist: "spk_f" (female) and "spk_m" (male).
-     *
-     * Every voiced frame adds evidence (log-likelihood ratio of its pitch: female ~205 Hz vs male ~120 Hz, border 157 Hz),
-     * weighted by how clear the pitch is, into a leaky score (>0 female, <0 male). Strongly pitched frames of the other
-     * gender flip the voice after ~3 frames (~0.2 s), while single bad frames (octave errors, background music) cannot.
-     * Each profile keeps a rolling buffer of its own latest 8 s of audio, saved (re-saved every >=20 s) as its clone reference.
+     * Tracks WHO is speaking (see [VoiceTracker]): gender from the pitch (robust YIN pitch, median of the last 8 voiced
+     * frames), and WHICH PERSON of that gender from pitch + timbre. Persons are spk_f1, spk_f2 ... (women) and
+     * spk_m1, spk_m2 ... (men). Each person keeps a rolling buffer of their own latest 8 s of audio, saved
+     * (re-saved every >=20 s) as that person's clone reference, so every person of the video gets their own cloned voice.
      */
     private fun audioLoop() {
-        val buf = ShortArray(512)               // 32 ms hop: a gender change is seen within milliseconds
+        val buf = ShortArray(512)               // 32 ms hop
         val win = ShortArray(1024)              // sliding 64 ms analysis window
-        val profs = HashMap<String, Prof>()
-        var cur: Prof? = null
-        var score = 0.0
+        val pe = FloatArray(1024)
+        val tracker = VoiceTracker()
         var lastVoiced = 0L
-        val mid = ln(157.0) / ln(2.0)
         val prefs = Prefs(this)
-
-        fun profFor(female: Boolean, f: Float): Prof {
-            val id = if (female) "spk_f" else "spk_m"
-            return profs.getOrPut(id) { Prof(id, f) }
-        }
 
         while (running) {
             val n = rec?.read(buf, 0, buf.size) ?: break
@@ -154,37 +138,25 @@ class AudioCaptureService : Service() {
             if (sqrt(e / buf.size) < 250) continue         // silence
             State.audioLoud++
             System.arraycopy(win, 512, win, 0, 512); System.arraycopy(buf, 0, win, 512, 512)
-            val f = f0(win)
-            var opposite = false
+            pe[0] = win[0].toFloat()
+            for (i in 1 until 1024) pe[i] = win[i].toFloat() - 0.8f * win[i - 1].toFloat()   // pre-emphasis: no bass / rumble pitch
+            val f = VoiceDsp.yin(pe)
+            var outlier = false
             if (f > 0f) {
-                if (lastVoiced != 0L && now - lastVoiced > 250) score *= 0.2   // new turn: forget the previous speaker fast
                 lastVoiced = now
-                val w = ((lastConf - 0.4) / 0.3).coerceIn(0.5, 1.0)            // clear pitch counts more
-                val d = (13.0 * (ln(f.toDouble()) / ln(2.0) - mid) * w).coerceIn(-4.0, 4.0)
-                score = (score * 0.7 + d).coerceIn(-5.0, 5.0)
-                // one clear, clearly-other-gender frame flips immediately (no waiting)
-                if (lastConf >= 0.7f && f > 185f && score < 2.0) score = 2.0
-                if (lastConf >= 0.7f && f < 135f && score > -2.0) score = -2.0
-                val want = if (score >= 2.0) true else if (score <= -2.0) false else null   // true = female
-                val c0 = cur
-                if (c0 == null) {
-                    if (want != null) cur = profFor(want, f)
-                } else {
-                    val curFemale = c0.id == "spk_f"
-                    if (want != null && want != curFemale) cur = profFor(want, f)
-                    else if (want == curFemale) c0.f0 = c0.f0 * 0.95f + f * 0.05f
-                    opposite = (d > 1.5 && !curFemale) || (d < -1.5 && curFemale)
-                }
-                State.profileF0["_live"] = f; State.profileF0["_score"] = score.toFloat()
-                cur?.let {
-                    State.speaker = it.id
-                    State.gender = if (it.id == "spk_f") "female" else "male"
-                    State.profileF0[it.id] = it.f0; it.lastUsed = now
+                State.lastSpeech = now
+                val v = tracker.onFrame(now, f.toDouble(), VoiceDsp.mfcc(win))
+                State.profileF0["_live"] = f; State.profileF0["_score"] = tracker.lastDist.toFloat()
+                if (v != null) {
+                    State.speaker = v.id
+                    State.gender = if (v.female) "female" else "male"
+                    State.profileF0[v.id] = exp(v.lf).toFloat()
+                    outlier = abs(ln(f.toDouble()) - v.lf) > 0.3      // a pitch far from this person: not their voice
                 }
             }
-            val c = cur ?: continue
+            val c = tracker.cur ?: continue
             if (!prefs.autoRef) continue
-            if (now - lastVoiced > 500 || opposite) continue      // keep the reference clean: speech of this speaker only
+            if (now - lastVoiced > 500 || outlier) continue        // keep the reference clean: speech of this person only
             for (s in buf) { c.ring[c.pos] = s; c.pos = (c.pos + 1) % RING }
             c.filled = minOf(RING, c.filled + buf.size)
             val need = if (c.lastSave == 0L) 16000 * 5 else RING      // first reference after 5 s, then 8 s windows
@@ -192,7 +164,7 @@ class AudioCaptureService : Service() {
         }
     }
 
-    private fun saveRef(p: Prof, samples: Int) {
+    private fun saveRef(p: Voice, samples: Int) {
         val total = minOf(samples, p.filled)
         val pcm = ByteBuffer.allocate(total * 2).order(ByteOrder.LITTLE_ENDIAN)
         val start = (p.pos - total + RING) % RING
@@ -209,38 +181,6 @@ class AudioCaptureService : Service() {
             try { Speaker.uploadAuto(applicationContext, p.id) }
             catch (e: Exception) { State.status = "reference upload: ${e.message}" }
         }
-    }
-
-    @Volatile private var lastConf = 0f      // clarity (0..1) of the last pitch found
-
-    /**
-     * Pitch estimate 75-350 Hz by normalised autocorrelation of the pre-emphasised signal (pre-emphasis suppresses bass,
-     * rumble and music low end that used to fake a "male" pitch). Picks the SHORTEST strong peak, so no octave-low errors.
-     * 0 = unvoiced / unclear.
-     */
-    private fun f0(raw: ShortArray): Float {
-        val n = raw.size
-        val x = FloatArray(n)
-        var prev = 0f; var e = 0.0
-        for (i in 0 until n) {
-            val v = raw[i].toFloat()
-            x[i] = v - 0.95f * prev; prev = v
-            e += x[i].toDouble() * x[i]
-        }
-        if (e < 1.0) return 0f
-        val r = DoubleArray(230)
-        var best = 0.0
-        for (lag in 46..213) {
-            var c = 0.0; var i = 0
-            while (i < n - lag) { c += x[i].toDouble() * x[i + lag]; i++ }
-            r[lag] = c / e
-            if (r[lag] > best) best = r[lag]
-        }
-        if (best < 0.45) return 0f
-        for (lag in 47..212) {
-            if (r[lag] >= 0.88 * best && r[lag] >= r[lag - 1] && r[lag] >= r[lag + 1]) { lastConf = best.toFloat(); return 16000f / lag }
-        }
-        return 0f
     }
 
     // ---------------- screen OCR (centred subtitle lines only) ----------------
@@ -281,7 +221,28 @@ class AudioCaptureService : Service() {
     private var acc = FloatArray(0)
     private val motionHist = ArrayDeque<Boolean>()
 
-    private fun resetMotion() { prevLum = null; motionHist.clear() }
+    private val rectHist = ArrayList<FloatArray>()
+
+    private fun resetMotion() { prevLum = null; motionHist.clear(); rectHist.clear() }
+
+    private fun iou(a: FloatArray, b: FloatArray): Float {
+        val l = maxOf(a[0], b[0]); val t = maxOf(a[1], b[1]); val r = minOf(a[2], b[2]); val bt = minOf(a[3], b[3])
+        val inter = maxOf(0f, r - l) * maxOf(0f, bt - t)
+        val ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+        return if (ua <= 0f) 0f else inter / ua
+    }
+
+    /**
+     * A video is a rectangle that keeps moving AT THE SAME PLACE for a while. A scrolling page, a swipe, a pop-up or an
+     * animation moves different areas from moment to moment (or only for a moment) and is therefore never accepted.
+     */
+    private fun stableRect(r: FloatArray?): FloatArray? {
+        if (r == null) { rectHist.clear(); return null }
+        rectHist.add(r)
+        while (rectHist.size > 6) rectHist.removeAt(0)
+        val same = rectHist.count { iou(it, r) >= 0.75f }
+        return if (rectHist.size >= 5 && same >= 4) r else null
+    }
 
     /**
      * Returns the playing video's rectangle (fractions l,t,r,b of the screen) or null when no video is playing.
@@ -355,6 +316,9 @@ class AudioCaptureService : Service() {
                 // read only while audio is playing and SubVoice's own screen is not in front
                 if (img != null && (State.appVisible || !am.isMusicActive)) {
                     img.close(); State.ocrText = "(idle)"; resetMotion(); VideoWatch.off()
+                } else if (img != null && !State.speechRecent()) {
+                    // subtitles belong to speech: nobody is speaking in the playing audio, so nothing on screen is read
+                    img.close(); State.ocrText = "(no speech heard in the video audio - nothing is read)"; VideoWatch.off()
                 } else if (img != null) {
                     val w = img.width; val h = img.height
                     val pl = img.planes[0]
@@ -363,16 +327,17 @@ class AudioCaptureService : Service() {
                     full.copyPixelsFromBuffer(pl.buffer)
                     img.close()
                     val frame = if (full.width == w) full else Bitmap.createBitmap(full, 0, 0, w, h)
-                    val vr = videoRect(frame)
+                    val vr = stableRect(videoRect(frame))
                     if (vr == null) {
                         State.ocrText = "(no playing video detected - subtitles are read only from a playing video)"
+                        VideoWatch.off()
                     } else {
                         VideoWatch.set(vr)
                         val vx = (vr[0] * w).toInt().coerceIn(0, w - 2)
                         val vy = (vr[1] * h).toInt().coerceIn(0, h - 2)
                         val vw = minOf(((vr[2] - vr[0]) * w).toInt(), w - vx)
                         val vh = minOf(((vr[3] - vr[1]) * h).toInt(), h - vy)
-                        val top = vy + (vh * 0.35).toInt()              // subtitles sit in the lower part of the VIDEO itself
+                        val top = vy + (vh * 0.58).toInt()              // subtitles sit in the lower part of the VIDEO itself (never the whole screen)
                         val ch = vy + vh - top
                         if (vw >= 64 && ch >= 24) {
                             val crop = Bitmap.createBitmap(frame, vx, top, vw, ch)
@@ -387,8 +352,9 @@ class AudioCaptureService : Service() {
                                 abs((b.left + b.right) / 2f - cw / 2f) < cw * 0.25f && b.width() < cw * 0.97f &&
                                     b.height() <= vh * sc * 0.16f && devShare(l.text) >= 0.5
                             }.sortedBy { it.boundingBox!!.top }
-                            val joined = lines.joinToString(" ") { it.text }
-                            handleOcr(joined)
+                            // a real subtitle is one to three short lines; a whole block of text is a page, not a subtitle
+                            val joined = if (lines.size in 1..3) lines.joinToString(" ") { it.text } else ""
+                            handleOcr(if (joined.length <= 220) joined else "")
                             if (joined.isBlank())
                                 State.ocrText = "(video found ${vw}x${vh}; no Hindi subtitle line. saw: ${res.text.replace('\n', ' ').take(40)})"
                             if (shot !== crop) shot.recycle()
